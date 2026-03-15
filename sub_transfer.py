@@ -2,8 +2,9 @@
 # coding=utf8
 """
 Sub arm (PatsyCline) - Dual-arm block transfer
-Waits for host signal, moves to handoff position with gripper rotated 90deg,
-grabs block from top/bottom, then places it at origin.
+Waits for host signal with block positions (already in sub coords),
+grabs block at handoff with gripper rotated 90deg,
+then stacks it on the blue block position.
 """
 import sys
 sys.path.append('/home/pi/ArmPi/')
@@ -19,23 +20,11 @@ import requests
 # ---- Configuration ----
 HOST_PI = 'MartyRobbins.engr.oregonstate.edu'
 SIGNAL_PORT = 9090
-
-# Handoff position in SUB's coordinate frame
-# Host holds at (0, 10, 10) in its frame
-# Mirrored: sub_x = -host_x = 0, sub_y = 2 * host_y_from_crosshair, sub_z = same
-# The host is at y=10 from its base, crosshair is at y~20 from base (image_center_distance)
-# so host_y_from_crosshair = 10 - 20 = -10 (block is between base and crosshair)
-# Actually: the coordinate system origin is at the arm base, y increases away from arm.
-# Crosshair is ~20cm from base. Host holds at y=10, so it's 10cm from its base.
-# For the sub (on opposite side), the same physical point is further away.
-# We need to calibrate this - starting with the same coordinates and adjusting.
-HANDOFF_COORD = (0, 20, 20)  # (x, y, z) cm - handoff position 20cm above crosshair
-
-PLACE_COORD = (0, 20, 1.5)  # Where to place the block (on the mat at crosshair)
+STACK_HEIGHT = 1.5  # z for placing block on top of blue (cm above mat)
 
 # ---- Arm setup ----
 AK = ArmIK()
-servo1 = 500  # gripper closed position
+servo1 = 500
 
 # ---- State machine ----
 class TransferState:
@@ -48,18 +37,30 @@ class TransferState:
     DONE = 6
 
 state = TransferState.WAITING
-state_lock = threading.Lock()
 host_ready = threading.Event()
 host_released = threading.Event()
+
+# Positions received from host (already in sub's coordinate frame)
+handoff_coord = None
+blue_coord = None
 
 # ---- Signal server (receives signals from host) ----
 class SignalHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        global handoff_coord, blue_coord
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         signal = body.get('signal', '')
+        data = body.get('data', {})
 
         if signal == 'ready_to_grab':
+            # Extract positions (already transformed to sub coords by host)
+            if 'handoff' in data:
+                handoff_coord = tuple(data['handoff'])
+                print(f"[SUB] Handoff position (sub coords): {handoff_coord}")
+            if 'blue' in data:
+                blue_coord = (data['blue'][0], data['blue'][1])
+                print(f"[SUB] Blue block position (sub coords): {blue_coord}")
             print("[SUB] Host is ready for handoff")
             host_ready.set()
             self.send_response(200)
@@ -84,7 +85,6 @@ def start_signal_server():
     server.serve_forever()
 
 def send_signal_to_host(signal):
-    """Send a coordination signal to the host Pi."""
     url = f'http://{HOST_PI}:{SIGNAL_PORT}'
     try:
         r = requests.post(url, json={'signal': signal}, timeout=5)
@@ -103,12 +103,10 @@ def init_move():
 def main():
     global state
 
-    # Start signal server thread
     sig_thread = threading.Thread(target=start_signal_server, daemon=True)
     sig_thread.start()
     print("[SUB] Signal server listening on port", SIGNAL_PORT)
 
-    # Init arm
     init_move()
     time.sleep(1.5)
     print("[SUB] Ready. Waiting for host signal...")
@@ -116,11 +114,13 @@ def main():
     try:
         while True:
             if state == TransferState.WAITING:
-                # Wait for host to signal it's holding the block
                 host_ready.wait(timeout=1)
                 if host_ready.is_set():
                     host_ready.clear()
-                    print("[SUB] Moving to handoff position...")
+                    if handoff_coord is None:
+                        print("[SUB] ERROR: No handoff position received!")
+                        continue
+                    print(f"[SUB] Moving to handoff at {handoff_coord}...")
                     state = TransferState.APPROACHING
 
             elif state == TransferState.APPROACHING:
@@ -128,49 +128,44 @@ def main():
                 Board.setBusServoPulse(1, servo1 - 280, 500)
                 time.sleep(0.5)
 
-                # Rotate gripper 90 degrees to grab top/bottom
-                # Servo 2 at 500 = default, 500 +/- ~250 = 90 deg rotation
-                # We want perpendicular to host's grip
-                Board.setBusServoPulse(2, 162, 500)  # ~120deg rotated from default
+                # Rotate gripper 90deg to grab top/bottom
+                Board.setBusServoPulse(2, 162, 500)  # ~120deg rotated
                 time.sleep(0.5)
 
                 # Move to handoff position
-                result = AK.setPitchRangeMoving(HANDOFF_COORD, -90, -90, 0)
+                result = AK.setPitchRangeMoving(handoff_coord, -90, -90, 0)
                 if result:
                     time.sleep(result[2] / 1000 + 0.5)
                     print("[SUB] At handoff position. Grabbing...")
                     state = TransferState.GRABBING
                 else:
-                    print("[SUB] WARNING: Handoff position unreachable!")
-                    # Try adjusting
-                    result = AK.setPitchRangeMoving((0, 10, 10), -30, -30, -90)
+                    print("[SUB] WARNING: Handoff unreachable, trying wider pitch...")
+                    result = AK.setPitchRangeMoving(handoff_coord, -30, -30, -90)
                     if result:
                         time.sleep(result[2] / 1000 + 0.5)
                     state = TransferState.GRABBING
 
             elif state == TransferState.GRABBING:
-                # Close gripper on block (top/bottom grip)
+                # Close gripper (top/bottom grip)
                 Board.setBusServoPulse(1, servo1, 500)
                 time.sleep(1)
 
-                # Signal host that we've grabbed
                 print("[SUB] Grabbed block. Signaling host...")
                 send_signal_to_host('grab_confirmed')
                 state = TransferState.WAITING_RELEASE
 
             elif state == TransferState.WAITING_RELEASE:
-                # Wait for host to release
                 host_released.wait(timeout=10)
                 if host_released.is_set():
                     host_released.clear()
-                    print("[SUB] Host released. Moving to place position...")
+                    print("[SUB] Host released. Placing on blue block...")
                     state = TransferState.PLACING
                 else:
                     print("[SUB] Timeout waiting for host release. Retrying...")
 
             elif state == TransferState.PLACING:
-                # Lift slightly first
-                AK.setPitchRangeMoving((HANDOFF_COORD[0], HANDOFF_COORD[1], HANDOFF_COORD[2] + 3),
+                # Lift slightly
+                AK.setPitchRangeMoving((handoff_coord[0], handoff_coord[1], handoff_coord[2] + 3),
                                        -90, -90, 0, 800)
                 time.sleep(1)
 
@@ -178,26 +173,33 @@ def main():
                 Board.setBusServoPulse(2, 500, 500)
                 time.sleep(0.5)
 
-                # Move above place position
-                result = AK.setPitchRangeMoving((PLACE_COORD[0], PLACE_COORD[1], 12),
-                                                -90, -90, 0)
+                if blue_coord:
+                    place_x, place_y = blue_coord
+                else:
+                    # Fallback to crosshair
+                    place_x, place_y = 0, 20
+
+                # Move above blue block
+                result = AK.setPitchRangeMoving((place_x, place_y, 12), -90, -90, 0)
                 if result:
                     time.sleep(result[2] / 1000 + 0.5)
 
-                # Lower to place position
-                AK.setPitchRangeMoving(PLACE_COORD, -90, -90, 0, 1000)
-                time.sleep(1.5)
+                # Lower to stack height (on top of blue block)
+                AK.setPitchRangeMoving((place_x, place_y, STACK_HEIGHT + 3), -90, -90, 0, 500)
+                time.sleep(0.5)
+
+                AK.setPitchRangeMoving((place_x, place_y, STACK_HEIGHT), -90, -90, 0, 1000)
+                time.sleep(1)
 
                 # Open gripper to release
                 Board.setBusServoPulse(1, servo1 - 200, 500)
                 time.sleep(0.8)
 
                 # Lift away
-                AK.setPitchRangeMoving((PLACE_COORD[0], PLACE_COORD[1], 12),
-                                       -90, -90, 0, 800)
+                AK.setPitchRangeMoving((place_x, place_y, 12), -90, -90, 0, 800)
                 time.sleep(1)
 
-                print("[SUB] Block placed! Returning to home...")
+                print("[SUB] Block placed on blue! Returning to home...")
                 state = TransferState.RETURNING
 
             elif state == TransferState.RETURNING:
